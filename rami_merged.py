@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from bluesky import core, stack, traf
 from bluesky.tools import geo
 import time
@@ -27,16 +28,25 @@ class NoiseContour(core.Entity):
     def __init__(self):
         super().__init__()
         self.active = False
+        self.grid_points = None
+        self.E_day = None
         self.active_flyovers = {}  # Track active flyovers
-        self.grid_points = self.generate_grid()         # Define grid
         self.E_sum = {}  # Track per-aircraft energy summation
-        self.E_day = np.zeros(self.grid_points.shape[:2]) # Track daily energy summation
         self.finalization_time = {} # Track when aircraft left monitoring area
         self.W = 0  # Weighting factor for SEL calculation needs to be developed further
 
     def generate_grid(self):
         ''' Generate grid points in local aircraft-relative coordinates (Δx, Δy). '''
-        pass
+        # self.grid_points[:,:,2] to acces it
+        self.grid_points = np.zeros((self.mesh_size[0], self.mesh_size[1], 2))
+        self.noise_area_lats = np.linspace(self.lat1, self.lat2, self.mesh_size[0])
+        self.noise_area_lons = np.linspace(self.lon1, self.lon2, self.mesh_size[1])
+        
+        for i in range(self.mesh_size[0]):
+            for j in range(self.mesh_size[1]):
+                self.grid_points[i, j, 0] = self.noise_area_lats[i]
+                self.grid_points[i, j, 1] = self.noise_area_lons[j]
+        return
     
     def compute_relative_pos(self, ac_id, ac_lat, ac_lon, ac_alt, ac_spd, ac_hdg, dt):
         ''' Compute noise at each grid point based on aircraft position. '''
@@ -73,7 +83,22 @@ class NoiseContour(core.Entity):
     
     def visualize_noise(self, L_DEN):
         ''' Placeholder function for visualizing the noise contour. '''
-        pass
+        filename = f'noise_{time.strftime("%Y%m%d_%H%M%S")}'
+        num_ticks = 5
+        fig, ax = plt.subplots(figsize=(6, 6))
+        m = plt.imshow(L_DEN, cmap='viridis', origin='lower')
+        ax.set_xticks(np.linspace(0+self.mesh_size[0]/(2*num_ticks), self.mesh_size[0]-self.mesh_size[0]/(2*num_ticks), num_ticks),
+                      labels=np.linspace(self.noise_area_lons[0], self.noise_area_lons[1], num_ticks))
+        ax.set_yticks(np.linspace(0+self.mesh_size[1]/(2*num_ticks), self.mesh_size[1]-self.mesh_size[1]/(2*num_ticks), num_ticks),
+                      labels=np.linspace(self.noise_area_lats[0], self.noise_area_lats[1], num_ticks))
+        
+        ax.set_aspect('equal')
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')
+        ax.set_title('Noise Heat Map')
+        plt.savefig(f'{filename}.png', dpi=300)
+        plt.close()
+        return
 
 
     def flyover_is_active(self, ac_id):
@@ -195,5 +220,26 @@ class NoiseContour(core.Entity):
 
         return True, f"Noise visualization {'enabled' if self.active else 'disabled'}, flyovers: {self.num_flyovers}"
 
+
+    @stack.command
+    def noisesetup(self, 
+                   lat1:float, lon1:float, 
+                   lat2:float, lon2:float, 
+                   mesh_x:int=25, mesh_y:int=25):
+        
+        self.lat1 = lat1
+        self.lon1 = lon1
+        self.lat2 = lat2
+        self.lon2 = lon2
+        
+        self.mesh_size = (mesh_y, mesh_x)
+        self.generate_grid()         # Define grid
+        self.E_day = np.zeros(self.grid_points.shape[:2]) # Track daily energy summation
+        
+        
+        
+        
+        
+        
     
 #IMPLEMENT LAST SUGGESTIONS

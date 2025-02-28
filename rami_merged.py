@@ -1,7 +1,7 @@
-from matplotlib.pylab import f
+
 import numpy as np
 import matplotlib.pyplot as plt
-from bluesky import core, stack, traf
+from bluesky import core, stack, traf, sim
 from bluesky.tools import geo
 import time
 
@@ -41,8 +41,9 @@ class NoiseContour(core.Entity):
         ''' Generate grid points in local aircraft-relative coordinates (Δx, Δy). '''
         # self.grid_points[:,:,2] to acces it
         self.grid_points = np.zeros((self.mesh_size[0], self.mesh_size[1], 2))
-        self.noise_area_lats = np.linspace(self.lat1, self.lat2)
-        self.noise_area_lons = np.linspace(self.lon1, self.lon2)
+        
+        self.noise_area_lats = np.linspace(self.lat1, self.lat2, num=self.mesh_size[0])	
+        self.noise_area_lons = np.linspace(self.lon1, self.lon2, num=self.mesh_size[0])
         
         self.noise_area_lats = np.sort(self.noise_area_lats)
         self.noise_area_lons = np.sort(self.noise_area_lons)
@@ -53,6 +54,9 @@ class NoiseContour(core.Entity):
                 self.grid_points[i, j, 0] = self.noise_area_lats[i].copy()
                 self.grid_points[i, j, 1] = self.noise_area_lons[j].copy()
         
+        print(self.grid_points[:,:,0])
+        print(self.grid_points[:,:,1])
+        
         stack.stack(f"POLYGON NOISEAREA,{self.lat1},{self.lon1},{self.lat1},{self.lon2},{self.lat2},{self.lon2},{self.lat2},{self.lon1}")
         stack.stack(f"COLOUR NOISEAREA,255,0,0")
         
@@ -60,14 +64,21 @@ class NoiseContour(core.Entity):
         print(f"grid generated with shape {self.grid_points.shape}")
         return
     
+    def latlon2xy(self, lat1, lon1, lat2, lon2):
+            ''' Convert lat/lon difference to meters. '''
+            dx = geo.latlondist(lat1, lon1, lat1, lon2)
+            dy = geo.latlondist(lat1, lon1, lat2, lon1)
+            return dx, dy
+        
     def compute_relative_pos(self, ac_id, ac_lat, ac_lon, ac_alt, ac_spd, ac_hdg, dt):
         ''' Compute noise at each grid point based on aircraft position. '''
-
+        
+    
         if ac_id not in self.E_sum:
             self.E_sum[ac_id] = np.zeros(self.grid_points.shape[:2])
 
         # Compute relative position in meters
-        dx, dy = geo.latlon2xy(ac_lat, ac_lon, self.grid_points[:, :, 0], self.grid_points[:, :, 1]) # Convert lat/lon diff to meters
+        dx, dy = self.latlon2xy(ac_lat, ac_lon, self.grid_points[:, :, 0], self.grid_points[:, :, 1]) # Convert lat/lon diff to meters
         dz = ac_alt  # Altitude difference (assuming ground level at 0m) converted to meters
         spd = ac_spd 
         ac_hdg_rad = np.radians(ac_hdg)
@@ -82,8 +93,13 @@ class NoiseContour(core.Entity):
         # Compute azimuth angle (angle from aircraft yaw axis)
         azimuth = np.arctan2(dy_body, dz) # Angle from vertical axis
 
+        OASPL = np.zeros(self.grid_points.shape[:2])
+        
+        for i in range(self.mesh_size[0]):
+            for j in range(self.mesh_size[1]):
+                OASPL[i,j] = self.ANOPP_OASPL(azimuth[i, j], polar[i, j], dz, dist[i, j], spd)
         # Placeholder for ANOPP noise calculation
-        OASPL = self.ANOPP_OASPL(azimuth, polar, dz, dist, spd)
+        # OASPL = self.ANOPP_OASPL(azimuth, polar, dz, dist, spd)
 
         # Update energy sum for SEL
         self.E_sum[ac_id] += 10**(OASPL / 10) * dt
@@ -138,7 +154,7 @@ class NoiseContour(core.Entity):
         M = spd / c
         rho = rho_0 * (temp / T_0)**(-g / (R * l) - 1)  
 
-
+        
         #clean wing calculations
         G_cw = 0.37 * (A_w/b_w**2) * ((rho * M * c * A_w)/(mu * b_w))**(-0.2)
         L_cw = G_cw * b_w
@@ -162,7 +178,7 @@ class NoiseContour(core.Entity):
         #flaps calculations
         G_fl = A_f/b_w**2 * (np.sin(df))**2
         L_fl = A_f / b_f
-        S_fl = (f_n * L_fl * (1 - M * np.cos(theta))) / (M * self.c)
+        S_fl = (f_n * L_fl * (1 - M * np.cos(theta))) / (M * c)
         F_fl = np.empty(S_fl.shape)
         F_fl[S_fl < 2] = 0.0480 * S_fl[S_fl < 2]
         F_fl[(2 <= S_fl) & (S_fl <= 20)] = 0.1406 * (S_fl[(2 <= S_fl) & (S_fl <= 20)])**(-0.55)
@@ -219,16 +235,18 @@ class NoiseContour(core.Entity):
         fig, ax = plt.subplots(figsize=(6, 6))
         m = plt.imshow(L_DEN, cmap='viridis', origin='lower')
         ax.set_xticks(np.linspace(0+self.mesh_size[0]/(2*num_ticks), self.mesh_size[0]-self.mesh_size[0]/(2*num_ticks), num_ticks),
-                      labels=np.linspace(self.noise_area_lons[0], self.noise_area_lons[1], num_ticks))
+                      labels=[f'{t:.2f}'for t in np.linspace(self.noise_area_lons[0], self.noise_area_lons[1], num_ticks)])
         ax.set_yticks(np.linspace(0+self.mesh_size[1]/(2*num_ticks), self.mesh_size[1]-self.mesh_size[1]/(2*num_ticks), num_ticks),
-                      labels=np.linspace(self.noise_area_lats[0], self.noise_area_lats[1], num_ticks))
+                      labels=[f'{t:.2f}'for t in np.linspace(self.noise_area_lats[0], self.noise_area_lats[1], num_ticks)])
         
         ax.set_aspect('equal')
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
         ax.set_title('Noise Heat Map')
+        plt.colorbar(m, ax=ax, label='L_DEN (dB)')
         plt.savefig(f'{filename}.png', dpi=300)
-        plt.close()
+        plt.show()
+        # plt.close()
         return
 
     def flyover_is_active(self, ac_id):
@@ -243,7 +261,7 @@ class NoiseContour(core.Entity):
         min_lon, max_lon = np.min(self.grid_points[:, :, 1]), np.max(self.grid_points[:, :, 1])
         print(f"min_lat: {min_lat}, max_lat: {max_lat}, min_lon: {min_lon}, max_lon: {max_lon}")
 
-        if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+        if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
             return False  # Aircraft left the monitoring area
 
         if alt > 1000:  # Assume 3000ft as max altitude for monitoring
@@ -262,9 +280,9 @@ class NoiseContour(core.Entity):
 
         del self.E_sum[ac_id]  # Remove this aircraft’s E_sum data
 
-    def finalize_day(self):
+    def finalize_day(self, flyover_time):
         ''' Compute L_DEN at the end of all flyovers. '''
-        L_DEN = -49.4 + 10 * np.log10(np.maximum(self.E_day, 1e-10))  # Convert accumulated SEL to L_DEN
+        L_DEN = 10*np.log10(1/flyover_time) + 10 * np.log10(np.maximum(self.E_day, 1e-10))  # Convert accumulated SEL to L_DEN
         return L_DEN
     
     def run_simulation(self, num_flyovers):
@@ -282,7 +300,7 @@ class NoiseContour(core.Entity):
         
         min_lat, max_lat = np.min(self.grid_points[:, :, 0]), np.max(self.grid_points[:, :, 0])
         min_lon, max_lon = np.min(self.grid_points[:, :, 1]), np.max(self.grid_points[:, :, 1])
-
+        
         for i in range(len(traf.id)):  # Loop over all aircraft
             ac_id = traf.id[i]  # Get aircraft ID
             lat, lon, alt, spd, hdg = traf.lat[i], traf.lon[i], traf.alt[i], traf.tas[i], traf.hdg[i]
@@ -290,14 +308,16 @@ class NoiseContour(core.Entity):
             
             print(f"ac_id: {ac_id}, lat: {lat}, lon: {lon}, alt: {alt}, spd: {spd}, hdg: {hdg}")
             
-            if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+            if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
+                print(f'min_lat: {min_lat}, max_lat: {max_lat}, min_lon: {min_lon}, max_lon: {max_lon}')
                 print(f"Aircraft {ac_id} is outside the monitoring area.")
                 continue  # Skip if aircraft is outside the grid
             
             if alt > 1000:  # Ignore aircraft above 3000 ft
                 print(f"Aircraft {ac_id} is above 1000 ft.")
                 continue  
-
+            
+            print(f"Computing noise for aircraft {ac_id}")
             # Compute noise contribution for this aircraft
             self.compute_relative_pos(ac_id, lat, lon, alt, spd, hdg, dt=1)
 
@@ -317,17 +337,25 @@ class NoiseContour(core.Entity):
                 if ac_id not in self.finalization_time:
                     self.finalization_time[ac_id] = time.time()  # Record exit time
 
-                elif time.time() - self.finalization_time[ac_id] > 5:  # Wait 5 sec before finalizing
+                elif (time.time() - self.finalization_time[ac_id] > 1) and (self.remaining_flyovers > 1): # Wait for 1s before finalizing
                     # If aircraft is no longer active, finalize its flyover
                     self.finalize_flyover(ac_id)
                     del self.active_flyovers[ac_id] # Remove from active list
                     print(f"Aircraft {ac_id} left the monitoring area.")
                     self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
                     self.remaining_flyovers -= 1
+                else:
+                    self.finalize_flyover(ac_id)
+                    del self.active_flyovers[ac_id] # Remove from active list
+                    print(f"Aircraft {ac_id} left the monitoring area.")
+                    self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
+                    self.remaining_flyovers -= 1
+                    self.sim_end_time = sim.simt
 
             else:
                 if ac_id in self.finalization_time:  # Reset finalization timer if aircraft returns
                     del self.finalization_time[ac_id]
+                    
 
         # Check for new aircraft entering the monitored area
         for i in range(len(traf.id)):
@@ -335,9 +363,16 @@ class NoiseContour(core.Entity):
             if ac_id not in self.active_flyovers and self.flyover_is_active(ac_id):
                 self.active_flyovers[ac_id] = True  # Mark new flyover as active
                 print(f"Aircraft {ac_id} entered the monitoring area.")
+                if self.remaining_flyovers == self.num_flyovers:
+                    print("First flyover started.")
+                    self.sim_start_time = sim.simt
 
         if self.remaining_flyovers == 0:
-            final_L_DEN = self.finalize_day()
+            print("All flyovers completed.")
+            
+            flyover_time = self.sim_end_time - self.sim_start_time
+            final_L_DEN = self.finalize_day(flyover_time)
+            sim.hold() # Pause simulation
             self.visualize_noise(final_L_DEN)
 
 

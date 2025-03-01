@@ -35,7 +35,6 @@ class NoiseContour(core.Entity):
         self.active_flyovers = {}  # Track active flyovers
         self.E_sum = {}  # Track per-aircraft energy summation
         self.finalization_time = {} # Track when aircraft left monitoring area
-        self.W = 0  # Weighting factor for SEL calculation needs to be developed further
 
     def generate_grid(self):
         ''' Generate grid points in local aircraft-relative coordinates (Δx, Δy). '''
@@ -54,14 +53,10 @@ class NoiseContour(core.Entity):
                 self.grid_points[i, j, 0] = self.noise_area_lats[i].copy()
                 self.grid_points[i, j, 1] = self.noise_area_lons[j].copy()
         
-        print(self.grid_points[:,:,0])
-        print(self.grid_points[:,:,1])
         
         stack.stack(f"POLYGON NOISEAREA,{self.lat1},{self.lon1},{self.lat1},{self.lon2},{self.lat2},{self.lon2},{self.lat2},{self.lon1}")
         stack.stack(f"COLOUR NOISEAREA,255,0,0")
         
-        
-        print(f"grid generated with shape {self.grid_points.shape}")
         return
     
     def latlon2xy(self, lat1, lon1, lat2, lon2):
@@ -259,7 +254,6 @@ class NoiseContour(core.Entity):
 
         min_lat, max_lat = np.min(self.grid_points[:, :, 0]), np.max(self.grid_points[:, :, 0])
         min_lon, max_lon = np.min(self.grid_points[:, :, 1]), np.max(self.grid_points[:, :, 1])
-        print(f"min_lat: {min_lat}, max_lat: {max_lat}, min_lon: {min_lon}, max_lon: {max_lon}")
 
         if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
             return False  # Aircraft left the monitoring area
@@ -270,13 +264,23 @@ class NoiseContour(core.Entity):
         return True
     
 
-    def finalize_flyover(self, ac_id):
+    def finalize_flyover(self, ac_id, utc_time):
         ''' Compute SEL for a specific aircraft and update total L_DEN contribution. '''
         if ac_id not in self.E_sum:
             return  # No energy data for this aircraft (should not happen)
+        
+        hour = utc_time.hour  
+
+        # Check if within the night period (23:00 - 07:00)
+        if hour >= 23 or hour < 7:
+            W = 10
+        elif 7 <= hour < 19:
+            W = 0
+        else:
+            W = 5
 
         SEL = 10 * np.log10(np.maximum(self.E_sum[ac_id], 1e-10))  # Prevent log(0) issues. Compute SEL from stored E_sum
-        self.E_day += 10 ** ((SEL + self.W) / 10)  # Add to daily noise energy
+        self.E_day += 10 ** ((SEL + W) / 10)  # Add to daily noise energy
 
         del self.E_sum[ac_id]  # Remove this aircraft’s E_sum data
 
@@ -304,12 +308,9 @@ class NoiseContour(core.Entity):
         for i in range(len(traf.id)):  # Loop over all aircraft
             ac_id = traf.id[i]  # Get aircraft ID
             lat, lon, alt, spd, hdg = traf.lat[i], traf.lon[i], traf.alt[i], traf.tas[i], traf.hdg[i]
-            
-            
-            print(f"ac_id: {ac_id}, lat: {lat}, lon: {lon}, alt: {alt}, spd: {spd}, hdg: {hdg}")
+       
             
             if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
-                print(f'min_lat: {min_lat}, max_lat: {max_lat}, min_lon: {min_lon}, max_lon: {max_lon}')
                 print(f"Aircraft {ac_id} is outside the monitoring area.")
                 continue  # Skip if aircraft is outside the grid
             
@@ -330,7 +331,6 @@ class NoiseContour(core.Entity):
             return  # Stop when all flyovers are completed
 
         active_aircraft = set(traf.id)  # Get current aircraft IDs in the simulation
-        print(f'all aircraft: {active_aircraft}')
         # Iterate over all tracked aircraft
         for ac_id in list(self.active_flyovers.keys()):
             if ac_id not in active_aircraft or not self.flyover_is_active(ac_id):  
@@ -339,13 +339,15 @@ class NoiseContour(core.Entity):
 
                 elif (time.time() - self.finalization_time[ac_id] > 1) and (self.remaining_flyovers > 1): # Wait for 1s before finalizing
                     # If aircraft is no longer active, finalize its flyover
-                    self.finalize_flyover(ac_id)
+                    end_time = sim.simtclock
+                    self.finalize_flyover(ac_id, end_time)
                     del self.active_flyovers[ac_id] # Remove from active list
                     print(f"Aircraft {ac_id} left the monitoring area.")
                     self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
                     self.remaining_flyovers -= 1
                 else:
-                    self.finalize_flyover(ac_id)
+                    end_time = sim.simtclock
+                    self.finalize_flyover(ac_id, end_time)
                     del self.active_flyovers[ac_id] # Remove from active list
                     print(f"Aircraft {ac_id} left the monitoring area.")
                     self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
@@ -374,25 +376,6 @@ class NoiseContour(core.Entity):
             final_L_DEN = self.finalize_day(flyover_time)
             sim.hold() # Pause simulation
             self.visualize_noise(final_L_DEN)
-
-
-    # @stack.command
-    # def toggle_noise_contour(self, num: int = None):
-    #     """Toggle noise contour visualization on/off."""
-    #     self.active = not self.active
-
-    #     if num is not None:
-    #         if num <= 0:
-    #             return False, "Number of flyovers must be positive."
-    #         self.num_flyovers = num
-
-    #     if self.active:
-    #         self.run_simulation(num_flyovers=self.num_flyovers)  # Start non-blocking simulation
-
-    #     if self.active and num is None:
-    #         return False, "Noise contour is already active."
-
-    #     return True, f"Noise visualization {'enabled' if self.active else 'disabled'}, flyovers: {self.num_flyovers}"
 
 
     @stack.command

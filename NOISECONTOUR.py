@@ -1,13 +1,30 @@
+"""
+Plugin for noise heatmap visualization. Using knowledge of course AE4431-23 Aircraft noise 
+Basic usage:
+With the simulator cleared and paused, run the following commands:
+0.Load using: Plugin load NOISECONTOUR
+1. NOISESETUP, lat1, lon1, lat2, lon2, mesh_x, mesh_y, num, plot_type
+    This command sets up the noise monitoring area and starts the noise visualization.
+    The rectangle defined by opposite corners (lat1, lon1) and (lat2, lon2) is divided into mesh_x x mesh_y grid points.
+    Example: Noisesetup 52.1 4.4 52.7 5.2 35 35 1 mpl  -> Would give a 35x35 grid with the area between 52.1, 4.4 and 52.7, 5.2 (Around EHAM)
+    num: Number of flyovers to expect.
+    plot_type: 'mpl' for matplotlib, 'px' for plotly express.
+2. Start the simulation and let the aircraft fly over the monitoring area.
+3. The plugin will automatically pause the simulation after the last flyover.
+4. A noise heatmap will be generated and saved as a PNG or HTML file in the output folder.
+
+Note: The plugin uses the ANOPP model to calculate noise levels. Currently, the plugin is set up for a Boeing 737 aircraft.
+You can edit the model or use a different one by modifying/replacing the ANOPP_OASPL function. The function needs to return a grid of noise levels in dBA each timestep.
+"""
+
 
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
 from bluesky import core, stack, traf, sim
 from bluesky.tools import geo
 import time
-from datetime import datetime
 
-### Initialization function of the plugin
+### Initialization function of the plugin (neede for all plugins)
 def init_plugin():
     ''' Plugin initialisation function. '''
     traf.noise_contour = NoiseContour()
@@ -25,48 +42,151 @@ class NoiseContour(core.Entity):
         super().__init__()
         self.active = False
         self.grid_points = None
-        self.E_day = None
+        self.E_period = None
         self.active_flyovers = {}  # Track active flyovers
         self.E_sum = {}  # Track per-aircraft energy summation
         self.finalization_time = {} # Track when aircraft left monitoring area
+        self.L_DEN = None
+        
+
+    @stack.command
+    def noisesetup(self, 
+                   lat1:float, lon1:float, 
+                   lat2:float, lon2:float, 
+                   mesh_x:int=25, mesh_y:int=25,
+                   num: int = 1):
+        
+        # set up the noise monitoring area
+        if lat1 == lat2 or lon1 == lon2:
+            return False, "Noise area must have non-zero area."
+        self.lat1 = lat1
+        self.lon1 = lon1
+        self.lat2 = lat2
+        self.lon2 = lon2
+        self.mesh_size = (mesh_y, mesh_x)
+        self.L_DEN = np.zeros(self.mesh_size)
+        self.generate_grid()         # Define grid
+        self.E_period = np.zeros(self.grid_points.shape[:2]) # setup energy sum
+
+        
+        if num is not None:
+            if num <= 0:
+                return False, "Number of flyovers must be positive."
+            self.num_flyovers = num
+
+        self.active = not self.active
+        
+        if self.active:
+            self.remaining_flyovers = self.num_flyovers
+
+        if self.active and num is None:
+            return False, "Noise contour is already active."
+
+        return True, f"Noise visualization {'enabled' if self.active else 'disabled'}, flyovers: {self.num_flyovers}"
+
+    @core.timed_function(name='update_noise', dt=1)
+    def update(self):
+        ''' Update noise contour based on aircraft position and altitude. '''
+        if len(traf.id) == 0:
+            return  # No aircraft in simulation
+        
+        min_lat, max_lat = np.min(self.grid_points[:, :, 0]), np.max(self.grid_points[:, :, 0])
+        min_lon, max_lon = np.min(self.grid_points[:, :, 1]), np.max(self.grid_points[:, :, 1])
+        
+        for i in range(len(traf.id)):  # Loop over all aircraft
+            ac_id = traf.id[i]  # Get aircraft ID
+            lat, lon, alt, spd, hdg = traf.lat[i], traf.lon[i], traf.alt[i], traf.tas[i], traf.hdg[i]
+            
+            
+            if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
+                continue  # Skip if aircraft is outside the grid
+            
+            if alt > 7000 * 0.3048:  # Ignore aircraft above 7000 ft
+                continue  
+            
+            # Compute noise contribution for this aircraft
+            self.calculate_noise_contributions(ac_id, lat, lon, alt, spd, hdg, dt=1)
+
+    @core.timed_function(name='monitor_flyovers', dt=1)  # Run every 0.05s
+    def monitor_flyovers(self):
+        ''' Monitors and finalizes flyovers in the background. '''
+        if self.remaining_flyovers <= 0:  
+            return  # Stop when all flyovers are completed
+
+        active_aircraft = set(traf.id)  # Get current aircraft IDs in the simulation
+        # Iterate over all tracked aircraft
+        for ac_id in list(self.active_flyovers.keys()):
+            # if aircraft is no longer active or has left the monitoring area, finalize its flyover
+            if ac_id not in active_aircraft or not self.flyover_is_active(ac_id):  
+                if ac_id not in self.finalization_time:
+                    self.finalization_time[ac_id] = time.time()  # Record exit time
+
+                elif (time.time() - self.finalization_time[ac_id] > 1) and (self.remaining_flyovers > 1): # Wait for 1s before finalizing
+                    # If aircraft is no longer active, finalize its flyover
+                    end_time = sim.utc
+                    self.finalize_flyover(ac_id, end_time)
+                    del self.active_flyovers[ac_id] # Remove from active list
+                    self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
+                    self.remaining_flyovers -= 1
+                else:
+                    end_time = sim.utc
+                    self.finalize_flyover(ac_id, end_time)
+                    del self.active_flyovers[ac_id] # Remove from active list
+                    self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
+                    self.remaining_flyovers -= 1
+                    self.sim_end_time = sim.simt
+
+            else:
+                if ac_id in self.finalization_time:  # Reset finalization timer if aircraft returns
+                    del self.finalization_time[ac_id]
+                    
+
+        # Check for new aircraft entering the monitored area
+        for i in range(len(traf.id)):
+            ac_id = traf.id[i]
+            if ac_id not in self.active_flyovers and self.flyover_is_active(ac_id):
+                self.active_flyovers[ac_id] = True  # Mark new flyover as active
+                if self.remaining_flyovers == self.num_flyovers:
+                    self.sim_start_time = sim.simt
+        
+        # Check if all flyovers are completed
+        if self.remaining_flyovers == 0:            
+            flyover_time = self.sim_end_time - self.sim_start_time
+            final_L_DEN = self.finalize_simulation(flyover_time)
+            self.L_DEN = final_L_DEN
+            sim.hold() # Pause simulation
+            self.visualize_noise_mpl(self.L_DEN)
 
     def generate_grid(self):
-        ''' Generate grid points in local aircraft-relative coordinates (Δx, Δy). '''
-        # self.grid_points[:,:,2] to acces it
-        self.grid_points = np.zeros((self.mesh_size[0], self.mesh_size[1], 2))
+        ''' Generate grid points for noise monitoring area. '''
+        # Create a 3D array to store lat, lon, and altitude. Use self.grid_points[:,:,0] and self.grid_points[:,:,1] to acces lat and lon respectively.
         
-        self.noise_area_lats = np.linspace(self.lat1, self.lat2, num=self.mesh_size[0])	
-        self.noise_area_lons = np.linspace(self.lon1, self.lon2, num=self.mesh_size[0])
+        self.noise_area_lats = np.linspace(self.lat1, self.lat2, num=self.mesh_size[0])
+        self.noise_area_lats.sort()
+        self.noise_area_lons = np.linspace(self.lon1, self.lon2, num=self.mesh_size[1])
+        self.noise_area_lons.sort()
+
+        # Create a meshgrid of latitudes and longitudes
+        lat_grid, lon_grid = np.meshgrid(self.noise_area_lats, self.noise_area_lons, indexing='ij')
+        self.grid_points = np.stack((lat_grid, lon_grid), axis=-1)
         
-        self.noise_area_lats = np.sort(self.noise_area_lats)
-        self.noise_area_lons = np.sort(self.noise_area_lons)
-        
-        
-        for i in range(self.mesh_size[0]):
-            for j in range(self.mesh_size[1]):
-                self.grid_points[i, j, 0] = self.noise_area_lats[i].copy()
-                self.grid_points[i, j, 1] = self.noise_area_lons[j].copy()
-        
+        # Plot the noise area on the radar screen
         stack.stack(f"POLYGON NOISEAREA,{self.lat1},{self.lon1},{self.lat1},{self.lon2},{self.lat2},{self.lon2},{self.lat2},{self.lon1}")
         stack.stack(f"COLOUR NOISEAREA,255,0,0")
         
         return
     
     def latlon2xy(self, lat1, lon1, lat2, lon2):
-            ''' Convert lat/lon difference to meters. '''
+            ''' Convert lat/lon difference to dx and dy in meters. '''
             dx = geo.latlondist(lat1, lon1, lat1, lon2)
             dy = geo.latlondist(lat1, lon1, lat2, lon1)
 
-            for i in range(self.mesh_size[0]):
-                for j in range(self.mesh_size[1]):
-                    if lat2[i,j] < lat1:
-                        dy[i,j] = -dy[i,j]
-                    if lon2[i,j] < lon1:
-                        dx[i,j] = -dx[i,j]
+            dy = np.where(lat2 < lat1, -dy, dy)
+            dx = np.where(lon2 < lon1, -dx, dx)
             return dx, dy
 
-    def compute_relative_pos(self, ac_id, ac_lat, ac_lon, ac_alt, ac_spd, ac_hdg, dt):
-        ''' Compute noise at each grid point based on aircraft position. '''
+    def calculate_noise_contributions(self, ac_id, ac_lat, ac_lon, ac_alt, ac_spd, ac_hdg, dt):
+        ''' Compute noise at each grid point based on aircraft position. Add the result to the energy sum. '''
         
         if ac_id not in self.E_sum:
             self.E_sum[ac_id] = np.zeros(self.grid_points.shape[:2])
@@ -76,7 +196,7 @@ class NoiseContour(core.Entity):
         dz = ac_alt  # Altitude difference (assuming ground level at 0m) 
         spd = ac_spd 
         ac_hdg_rad = np.radians(ac_hdg)
-        # Rotate dx, dy into aircraft body frame (map coordinates: x: east, y: north, z: up) (aircraft-centric coordinates, x: forward (out of nose), y: out of right left wing, z: down)
+        # Rotate dx, dy into aircraft body frame (map coordinates: x: east, y: north, z: up) (aircraft-centric coordinates, x: forward (out of nose), y: out of right wing, z: down)
         dx_body = dy * np.cos(ac_hdg_rad) + dx * np.sin(ac_hdg_rad)  # Convert to aircraft body frame
         dy_body = -dy * np.sin(ac_hdg_rad) + dx * np.cos(ac_hdg_rad)  # Convert to aircraft body frame
         
@@ -99,24 +219,12 @@ class NoiseContour(core.Entity):
     
     def ANOPP_OASPL(self, azimuth, polar, dz, dist, spd):
         
-        #Flight parameters
-        T_0 = 288.15
-        rho_0 = 1.225
-        R = 287.05
-        g = 9.80665
-        l = -0.0065
-        gamma = 1.4 
-        mu = 1.84E-5 #ambient dynamic viscosity [kg/(ms)]
+        
+        # Constatns and parameters for the airframe are defined in the script below to avoid allocating memory each time the function is called
+        
         theta = polar
         phi = azimuth
-        r = 1
-        pe02 = (2E-5)**2 #reference value
-
-        #Aircraft parameters (currently defined for B737)
-        A_w  = 130 #wing area [m^2]
-        b_w = 34 #wing span [m]
-        A_f = 18 #flap area [m^2]
-        b_f = 17 #flap span [m]
+        
 
         #Flap control
         V = spd * 1.94384 #speed [kts]
@@ -140,21 +248,6 @@ class NoiseContour(core.Entity):
         if dz < 2000 * 0.3048:
             gear = 1
 
-        n_MLG = 2 #number of wheels per boggie (MLG) [-]
-        d_MLG = 1.13 #diameter of MLG [m]
-        d_NLG = 0.7 #diameter of NLG [m]   
-
-
-        #Parameters for geometry function
-        K_CW = 4.646E-5 #K constant for trailing edge clean wing [-]
-        K_SL = 4.646E-5 #K constant for leading edge slats [-]
-        K_FL = 2.787E-4 #K constant for trailing edge slats [-]
-        K_LDG_2 = 4.349E-4 #K constant for landing gear with 2 wheels [-]
-        K_LDG_4 = 3.414E-4 #K constant for landing gear with 4 wheels [-]
-        a_CW = 5 #a constant for clean wing [-]
-        a_SL = 5 #a constant for LE slats [-]
-        a_FL = 6 #a constant for TE flaps [-]
-        a_LDG = 6 #a constant for landing gear (both MLG and NLG) [-]
 
         #Frequencies for 1/3 octave band
         band_numbers = np.arange(1, 44) #band numbers
@@ -236,88 +329,31 @@ class NoiseContour(core.Entity):
         PBL_total_A = PBL_total + dL_A - 20 * np.log10(dist) + 4 # a few decibels added to account for  engine noise
 
         #OASPL (or L_A) calculation + very rudimentary atmospheric attentuation
-        sum = 0
+        total_pressure_sum = 0
         for i in range(len(PBL_total_A)):
             if 63 <= f_n[i] < 125:
-                sum += 10 ** ((PBL_total_A[i] - 0.0573 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 0.108 * 1e-3 * dist) / 10) 
             elif 125 <= f_n[i] < 250:
-                sum += 10 ** ((PBL_total_A[i] - 0.223 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 0.373 * 1e-3 * dist) / 10) 
             elif 250 <= f_n[i] < 500:
-                sum += 10 ** ((PBL_total_A[i] - 0.756 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 1.02 * 1e-3 * dist) / 10) 
             elif 500 <= f_n[i] < 1000:
-                sum += 10 ** ((PBL_total_A[i] - 1.51 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 1.96 * 1e-3 * dist) / 10) 
             elif 1000 <= f_n[i] < 2000:
-                sum += 10 ** ((PBL_total_A[i] - 3.57 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 3.57 * 1e-3 * dist) / 10) 
             elif 2000 <= f_n[i] < 4000:
-                sum += 10 ** ((PBL_total_A[i] - 8.80 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 8.80 * 1e-3 * dist) / 10) 
             elif 4000 <= f_n[i] < 8000:
-                sum += 10 ** ((PBL_total_A[i] - 21.4 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 29.0 * 1e-3 * dist) / 10) 
             elif 8000 <= f_n[i]:
-                sum += 10 ** ((PBL_total_A[i] - 56.4 * 1e-3 * dist) / 10) 
+                total_pressure_sum += 10 ** ((PBL_total_A[i] - 105 * 1e-3 * dist) / 10) 
             else:
-                sum += 10 ** (PBL_total_A[i] / 10) 
+                total_pressure_sum += 10 ** (PBL_total_A[i]/10)
 
-        OASPL = 10 * np.log10(sum)
+        OASPL = 10 * np.log10(total_pressure_sum)
 
         return OASPL
     
-    def visualize_noise_mpl(self, L_DEN):
-        ''' Placeholder function for visualizing the noise contour. '''
-        filename = f'noise_{time.strftime("%Y%m%d_%H%M%S")}'
-        num_ticks = 5
-        fig, ax = plt.subplots(figsize=(6, 6))
-        m = plt.imshow(L_DEN, cmap='jet', origin='lower')
-        ax.set_xticks(np.linspace(0+self.mesh_size[0]/(2*num_ticks), self.mesh_size[0]-self.mesh_size[0]/(2*num_ticks), num_ticks),
-                      labels=[f'{t:.2f}'for t in np.linspace(self.noise_area_lons[0], self.noise_area_lons[1], num_ticks)])
-        ax.set_yticks(np.linspace(0+self.mesh_size[1]/(2*num_ticks), self.mesh_size[1]-self.mesh_size[1]/(2*num_ticks), num_ticks),
-                      labels=[f'{t:.2f}'for t in np.linspace(self.noise_area_lats[0], self.noise_area_lats[1], num_ticks)])
-        
-        ax.set_aspect('equal')
-        ax.set_xlabel('Longitude')
-        ax.set_ylabel('Latitude')
-        ax.set_title('Noise Heat Map')
-        plt.colorbar(m, ax=ax, label='L_DEN (dBA)')
-        plt.savefig(f'{filename}.png', dpi=300)
-        plt.show()
-        # plt.close()
-        return
-    
-    def visualize_noise_px(self, L_DEN):
-        try:
-            import plotly.express as px
-        except ModuleNotFoundError:
-            stack.stack("ECHO Plotly express not found. Install with 'pip install plotly'")
-            stack.stack("Switching to matplotlib visualization")
-            self.plot_type = 'mpl'
-            self.visualize_noise_mpl(L_DEN)
-            return
-        
-        filename = f'noise_{time.strftime("%Y%m%d_%H%M%S")}'
-        lats_flat = np.zeros(self.mesh_size[0] * self.mesh_size[1])
-        lons_flat = np.zeros(self.mesh_size[0] * self.mesh_size[1])
-
-        
-        
-        lons_flat, lats_flat = np.meshgrid(self.noise_area_lons, self.noise_area_lats)
-        lats_flat = lats_flat.flatten()
-        lons_flat = lons_flat.flatten()
-
-        mesh_df = pd.DataFrame({'lon': lons_flat, 'lat': lats_flat, 'Noise L_DEN (dBA)': L_DEN.flatten(),})
-
-        figpx = px.density_map(mesh_df, 
-                       lon='lon', 
-                       lat='lat', 
-                       z='Noise L_DEN (dBA)', 
-                       title="Noise Heat Map", 
-                       opacity=0.50, 
-                       zoom=6,
-                       radius=50,)
-        
-        figpx.write_html(fr'output/{filename}.html')
-        stack.stack(fr"ECHO Noise contour saved as output/{filename}.html")
-
-        return
-
     def flyover_is_active(self, ac_id):
         ''' Check if the given aircraft is still flying within the monitored area. '''
         if ac_id not in traf.id:
@@ -337,7 +373,6 @@ class NoiseContour(core.Entity):
 
         return True
     
-
     def finalize_flyover(self, ac_id, utc_time):
         ''' Compute SEL for a specific aircraft and update total L_DEN contribution. '''
         if ac_id not in self.E_sum:
@@ -354,139 +389,80 @@ class NoiseContour(core.Entity):
             W = 5
 
         SEL = 10 * np.log10(np.maximum(self.E_sum[ac_id], 1e-10))  # Prevent log(0) issues. Compute SEL from stored E_sum
-        self.E_day += 10 ** ((SEL + W) / 10)  # Add to daily noise energy
+        self.E_period += 10 ** ((SEL + W) / 10)  # Add to daily noise energy
 
         del self.E_sum[ac_id]  # Remove this aircraft’s E_sum data
 
-    def finalize_day(self, flyover_time):
+    def finalize_simulation(self, flyover_time):
         ''' Compute L_DEN at the end of all flyovers. '''
-        L_DEN = 10*np.log10(1/flyover_time) + 10 * np.log10(np.maximum(self.E_day, 1e-10))  # Convert accumulated SEL to L_DEN
+        L_DEN = 10*np.log10(1/flyover_time) + 10 * np.log10(np.maximum(self.E_period, 1e-10))  # Convert accumulated SEL to L_DEN
         
         # Apply minimum noise level of 45 dB
-        for i in range(self.mesh_size[0]):
-            for j in range(self.mesh_size[1]):
-                if L_DEN[i, j] < 35:
-                    L_DEN[i, j] = 35
+        L_DEN = np.maximum(L_DEN, 30)
         
-        return L_DEN
+        return L_DEN     
+
+    def visualize_noise_mpl(self, L_DEN):
+        ''' Visualize noise contour using matplotlib. '''
+        filename = f'noise_{time.strftime("%Y%m%d_%H%M%S")}'
+        num_ticks = 5
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        # Set extent so the image spans the real-world coordinate ranges
+        extent = [self.noise_area_lons[0], self.noise_area_lons[-1], self.noise_area_lats[0], self.noise_area_lats[-1]]
+        m = ax.imshow(L_DEN, cmap='jet', origin='lower', extent=extent)
+        
+        # Create tick locations directly from lon/lat ranges
+        xticks = np.linspace(self.noise_area_lons[0], self.noise_area_lons[-1], num_ticks)
+        yticks = np.linspace(self.noise_area_lats[0], self.noise_area_lats[-1], num_ticks)
+        
+        ax.set_xticks(xticks)
+        ax.set_xticklabels([f"{x:.2f}" for x in xticks])
+        ax.set_yticks(yticks)
+        ax.set_yticklabels([f"{y:.2f}" for y in yticks])
+        
+        ax.set_aspect('auto')
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')
+        ax.set_title('Noise Heat Map')
+        plt.colorbar(m, ax=ax, label='L_DEN (dBA)')
+        
+        plt.tight_layout()  # Remove extra white space around the plot
+        plt.savefig(f'output/{filename}.png', dpi=300)
+        stack.stack(f"ECHO Noise contour saved as output/{filename}.png")
+        plt.show()
+        return
     
-    def run_simulation(self, num_flyovers):
-        ''' Manage multiple flyovers without freezing the simulation. '''
-        self.remaining_flyovers = num_flyovers  # Store flyover count
-        self.active_flyover = False  # No flyover is currently running
 
+### constants
+#Flight parameters
+T_0 = 288.15
+rho_0 = 1.225
+R = 287.05
+g = 9.80665
+l = -0.0065
+gamma = 1.4 
+mu = 1.84E-5 #ambient dynamic viscosity [kg/(ms)]
+r = 1
+pe02 = (2E-5)**2 #reference value
 
-    @core.timed_function(name='update_noise', dt=1)
-    def update(self):
-        ''' Update noise contour based on aircraft position and altitude. '''
-        if len(traf.id) == 0:
-            return  # No aircraft in simulation
-        
-        min_lat, max_lat = np.min(self.grid_points[:, :, 0]), np.max(self.grid_points[:, :, 0])
-        min_lon, max_lon = np.min(self.grid_points[:, :, 1]), np.max(self.grid_points[:, :, 1])
-        
-        for i in range(len(traf.id)):  # Loop over all aircraft
-            ac_id = traf.id[i]  # Get aircraft ID
-            lat, lon, alt, spd, hdg = traf.lat[i], traf.lon[i], traf.alt[i], traf.tas[i], traf.hdg[i]
-            
-            
-            if not ((min_lat <= lat) and (lat <= max_lat) and (min_lon <= lon) and (lon <= max_lon)):
-                continue  # Skip if aircraft is outside the grid
-            
-            if alt > 7000 * 0.3048:  # Ignore aircraft above 3000 ft
-                continue  
-            
-            # Compute noise contribution for this aircraft
-            self.compute_relative_pos(ac_id, lat, lon, alt, spd, hdg, dt=1)
+#Aircraft parameters (currently defined for B737)
+A_w  = 130 #wing area [m^2]
+b_w = 34 #wing span [m]
+A_f = 18 #flap area [m^2]
+b_f = 17 #flap span [m]
 
+n_MLG = 2 #number of wheels per boggie (MLG) [-]
+d_MLG = 1.13 #diameter of MLG [m]
+d_NLG = 0.7 #diameter of NLG [m]   
 
-    @core.timed_function(name='monitor_flyovers', dt=1)  # Run every 0.05s
-    def monitor_flyovers(self):
-        ''' Monitors and finalizes flyovers in the background. '''
-        if self.remaining_flyovers <= 0:  
-            return  # Stop when all flyovers are completed
-
-        active_aircraft = set(traf.id)  # Get current aircraft IDs in the simulation
-        # Iterate over all tracked aircraft
-        for ac_id in list(self.active_flyovers.keys()):
-            if ac_id not in active_aircraft or not self.flyover_is_active(ac_id):  
-                if ac_id not in self.finalization_time:
-                    self.finalization_time[ac_id] = time.time()  # Record exit time
-
-                elif (time.time() - self.finalization_time[ac_id] > 1) and (self.remaining_flyovers > 1): # Wait for 1s before finalizing
-                    # If aircraft is no longer active, finalize its flyover
-                    end_time = sim.utc
-                    self.finalize_flyover(ac_id, end_time)
-                    del self.active_flyovers[ac_id] # Remove from active list
-                    self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
-                    self.remaining_flyovers -= 1
-                else:
-                    end_time = sim.utc
-                    self.finalize_flyover(ac_id, end_time)
-                    del self.active_flyovers[ac_id] # Remove from active list
-                    self.finalization_time.pop(ac_id, None)  # Safe delete. Remove from finalization tracking
-                    self.remaining_flyovers -= 1
-                    self.sim_end_time = sim.simt
-
-            else:
-                if ac_id in self.finalization_time:  # Reset finalization timer if aircraft returns
-                    del self.finalization_time[ac_id]
-                    
-
-        # Check for new aircraft entering the monitored area
-        for i in range(len(traf.id)):
-            ac_id = traf.id[i]
-            if ac_id not in self.active_flyovers and self.flyover_is_active(ac_id):
-                self.active_flyovers[ac_id] = True  # Mark new flyover as active
-                if self.remaining_flyovers == self.num_flyovers:
-                    self.sim_start_time = sim.simt
-
-        if self.remaining_flyovers == 0:            
-            flyover_time = self.sim_end_time - self.sim_start_time
-            final_L_DEN = self.finalize_day(flyover_time)
-            sim.hold() # Pause simulation
-            if self.plot_type == 'px':
-                self.visualize_noise_px(final_L_DEN)
-            elif self.plot_type == 'mpl':
-                self.visualize_noise_mpl(final_L_DEN)
-
-    @stack.command
-    def noisesetup(self, 
-                   lat1:float, lon1:float, 
-                   lat2:float, lon2:float, 
-                   mesh_x:int=25, mesh_y:int=25,
-                   num: int = None,
-                   plot_type: str = 'mpl'):
-        
-        if plot_type not in ['mpl', 'px']:
-            stack.stack("ECHO Invalid plot type. Choose 'mpl' or 'px'.")
-            return
-        self.plot_type = plot_type
-        self.lat1 = lat1
-        self.lon1 = lon1
-        self.lat2 = lat2
-        self.lon2 = lon2
-        
-        self.mesh_size = (mesh_y, mesh_x)
-        self.generate_grid()         # Define grid
-        self.E_day = np.zeros(self.grid_points.shape[:2]) # Track daily energy summation
-
-
-        self.active = not self.active
-
-        if num is not None:
-            if num <= 0:
-                return False, "Number of flyovers must be positive."
-            self.num_flyovers = num
-
-        if self.active:
-            self.run_simulation(num_flyovers=self.num_flyovers)  # Start non-blocking simulation
-
-        if self.active and num is None:
-            return False, "Noise contour is already active."
-
-        return True, f"Noise visualization {'enabled' if self.active else 'disabled'}, flyovers: {self.num_flyovers}"
-        
-        
-        
-        
+#Parameters for geometry function
+K_CW = 4.646E-5 #K constant for trailing edge clean wing [-]
+K_SL = 4.646E-5 #K constant for leading edge slats [-]
+K_FL = 2.787E-4 #K constant for trailing edge slats [-]
+K_LDG_2 = 4.349E-4 #K constant for landing gear with 2 wheels [-]
+K_LDG_4 = 3.414E-4 #K constant for landing gear with 4 wheels [-]
+a_CW = 5 #a constant for clean wing [-]
+a_SL = 5 #a constant for LE slats [-]
+a_FL = 6 #a constant for TE flaps [-]
+a_LDG = 6 #a constant for landing gear (both MLG and NLG) [-]
